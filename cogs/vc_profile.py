@@ -10,7 +10,7 @@ log = logging.getLogger(__name__)
 PROF_TC_ID = 1481378900352434358
 MEN_ROLE_ID = 1477396194018984062
 WOMEN_ROLE_ID = 1477396319139008646
-PROFILE_HISTORY_LIMIT = 10  # 起動後にキャッシュが空だった場合、過去メッセージをどこまで遡るか
+PROFILE_HISTORY_LIMIT = 100 # 起動後にキャッシュが空だった場合、過去メッセージをどこまで遡るか
 
 MEN_COLOR = discord.Color.from_rgb(173, 216, 230)      # 薄水色
 WOMEN_COLOR = discord.Color.from_rgb(255, 182, 193)    # 薄ピンク
