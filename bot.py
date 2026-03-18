@@ -28,6 +28,7 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.invite_tracker")
         await self.load_extension("cogs.laliho")
         await self.load_extension("cogs.auto_reply")
+        await self.load_extension("cogs.vc_profile")
 
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
