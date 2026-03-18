@@ -7,7 +7,7 @@ from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-PROF_TC_ID = 1481378900100
+PROF_TC_ID = 1481378900352434358
 MEN_ROLE_ID = 1477396194018984062
 WOMEN_ROLE_ID = 1477396319139008646
 PROFILE_HISTORY_LIMIT = 10  # 起動後にキャッシュが空だった場合、過去メッセージをどこまで遡るか
