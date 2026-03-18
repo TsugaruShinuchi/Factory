@@ -27,8 +27,6 @@ class MyBot(commands.Bot):
 
         await self.load_extension("cogs.invite_tracker")
         await self.load_extension("cogs.laliho")
-
-        await self.load_extension("cogs.invite_tracker")
         await self.load_extension("cogs.auto_reply")
 
         guild = discord.Object(id=GUILD_ID)
