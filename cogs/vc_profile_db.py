@@ -11,11 +11,15 @@ MEN_COLOR = discord.Color.from_rgb(173, 216, 230)      # 薄水色
 WOMEN_COLOR = discord.Color.from_rgb(255, 182, 193)    # 薄ピンク
 DEFAULT_COLOR = discord.Color.light_grey()
 
+IMPORT_DEFAULT_LIMIT = 5000
+REBUILD_LIMIT_PER_CHANNEL = 3000
+
 
 class VCProfileDBCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.settings_cache: dict[int, dict] = {}
+        self.profile_channels_cache: dict[int, list[int]] = {}
         self.startup_sync_done = False
 
     async def cog_load(self):
@@ -36,6 +40,13 @@ class VCProfileDBCog(commands.Cog):
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS guild_profile_channels (
+            guild_id    BIGINT NOT NULL,
+            channel_id  BIGINT NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (guild_id, channel_id)
+        );
+
         CREATE TABLE IF NOT EXISTS member_profiles (
             guild_id            BIGINT NOT NULL,
             user_id             BIGINT NOT NULL,
@@ -43,6 +54,7 @@ class VCProfileDBCog(commands.Cog):
             profile_message_id  BIGINT NOT NULL,
             profile_content     TEXT,
             profile_jump_url    TEXT NOT NULL,
+            source_created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (guild_id, user_id)
         );
@@ -66,8 +78,19 @@ class VCProfileDBCog(commands.Cog):
         async with self.bot.db.acquire() as conn:
             await conn.execute(sql)
 
+            # 旧テーブルからの移行対策
+            await conn.execute("""
+                ALTER TABLE member_profiles
+                ADD COLUMN IF NOT EXISTS source_created_at TIMESTAMPTZ
+            """)
+            await conn.execute("""
+                UPDATE member_profiles
+                SET source_created_at = updated_at
+                WHERE source_created_at IS NULL
+            """)
+
     # =========================
-    # 設定
+    # 設定 / チャンネル
     # =========================
     async def get_settings(self, guild_id: int, refresh: bool = False) -> Optional[dict]:
         if not refresh and guild_id in self.settings_cache:
@@ -88,6 +111,34 @@ class VCProfileDBCog(commands.Cog):
         data = dict(row)
         self.settings_cache[guild_id] = data
         return data
+
+    async def get_profile_channel_ids(self, guild_id: int, refresh: bool = False) -> list[int]:
+        if not refresh and guild_id in self.profile_channels_cache:
+            return self.profile_channels_cache[guild_id]
+
+        settings = await self.get_settings(guild_id, refresh=refresh)
+        channel_ids: set[int] = set()
+
+        if settings:
+            channel_ids.add(settings["prof_tc_id"])
+
+        sql = """
+        SELECT channel_id
+        FROM guild_profile_channels
+        WHERE guild_id = $1
+        """
+        async with self.bot.db.acquire() as conn:
+            rows = await conn.fetch(sql, guild_id)
+
+        for row in rows:
+            channel_ids.add(row["channel_id"])
+
+        result = sorted(channel_ids)
+        self.profile_channels_cache[guild_id] = result
+        return result
+
+    async def is_profile_channel(self, guild_id: int, channel_id: int) -> bool:
+        return channel_id in await self.get_profile_channel_ids(guild_id)
 
     async def upsert_settings(
         self,
@@ -114,6 +165,55 @@ class VCProfileDBCog(commands.Cog):
             await conn.execute(sql, guild_id, prof_tc_id, men_role_id, women_role_id, enabled)
 
         await self.get_settings(guild_id, refresh=True)
+        await self.get_profile_channel_ids(guild_id, refresh=True)
+
+    async def add_profile_channel(self, guild_id: int, channel_id: int):
+        sql = """
+        INSERT INTO guild_profile_channels (guild_id, channel_id)
+        VALUES ($1, $2)
+        ON CONFLICT (guild_id, channel_id) DO NOTHING
+        """
+        async with self.bot.db.acquire() as conn:
+            await conn.execute(sql, guild_id, channel_id)
+
+        await self.get_profile_channel_ids(guild_id, refresh=True)
+
+    async def remove_profile_channel(self, guild_id: int, channel_id: int) -> tuple[bool, str]:
+        settings = await self.get_settings(guild_id, refresh=True)
+        if settings is None:
+            return False, "先に /vcプロフ設定 を実行してください。"
+
+        primary_channel_id = settings["prof_tc_id"]
+        all_channels = await self.get_profile_channel_ids(guild_id, refresh=True)
+        extra_channels = [cid for cid in all_channels if cid != primary_channel_id]
+
+        async with self.bot.db.acquire() as conn:
+            if channel_id == primary_channel_id:
+                if not extra_channels:
+                    return False, "最後のプロフィールチャンネルは削除できません。先に別チャンネルを追加してください。"
+
+                promoted = extra_channels[0]
+
+                await conn.execute("""
+                    UPDATE guild_profile_settings
+                    SET prof_tc_id = $2,
+                        updated_at = NOW()
+                    WHERE guild_id = $1
+                """, guild_id, promoted)
+
+                await conn.execute("""
+                    DELETE FROM guild_profile_channels
+                    WHERE guild_id = $1 AND channel_id = $2
+                """, guild_id, promoted)
+
+            await conn.execute("""
+                DELETE FROM guild_profile_channels
+                WHERE guild_id = $1 AND channel_id = $2
+            """, guild_id, channel_id)
+
+        await self.get_settings(guild_id, refresh=True)
+        await self.get_profile_channel_ids(guild_id, refresh=True)
+        return True, "プロフィールチャンネルを削除しました。"
 
     async def disable_settings(self, guild_id: int):
         sql = """
@@ -153,16 +253,20 @@ class VCProfileDBCog(commands.Cog):
             profile_message_id,
             profile_content,
             profile_jump_url,
+            source_created_at,
             updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
         ON CONFLICT (guild_id, user_id)
         DO UPDATE SET
             profile_channel_id = EXCLUDED.profile_channel_id,
             profile_message_id = EXCLUDED.profile_message_id,
             profile_content = EXCLUDED.profile_content,
             profile_jump_url = EXCLUDED.profile_jump_url,
+            source_created_at = EXCLUDED.source_created_at,
             updated_at = NOW()
+        WHERE member_profiles.source_created_at IS NULL
+           OR EXCLUDED.source_created_at >= member_profiles.source_created_at
         """
         async with self.bot.db.acquire() as conn:
             await conn.execute(
@@ -173,6 +277,7 @@ class VCProfileDBCog(commands.Cog):
                 message.id,
                 content,
                 message.jump_url,
+                message.created_at,
             )
 
     async def update_profile_if_current_message(self, message: discord.Message):
@@ -197,20 +302,10 @@ class VCProfileDBCog(commands.Cog):
                 message.jump_url,
             )
 
-    async def delete_profile_if_current_message(self, message: discord.Message):
-        sql = """
-        DELETE FROM member_profiles
-        WHERE guild_id = $1
-          AND user_id = $2
-          AND profile_message_id = $3
-        """
-        async with self.bot.db.acquire() as conn:
-            await conn.execute(sql, message.guild.id, message.author.id, message.id)
-
     async def get_profile(self, guild_id: int, user_id: int) -> Optional[dict]:
         sql = """
         SELECT guild_id, user_id, profile_channel_id, profile_message_id,
-               profile_content, profile_jump_url, updated_at
+               profile_content, profile_jump_url, source_created_at, updated_at
         FROM member_profiles
         WHERE guild_id = $1
           AND user_id = $2
@@ -219,6 +314,86 @@ class VCProfileDBCog(commands.Cog):
             row = await conn.fetchrow(sql, guild_id, user_id)
 
         return dict(row) if row else None
+
+    async def delete_profile_by_message_id(self, guild_id: int, message_id: int) -> Optional[int]:
+        sql_select = """
+        SELECT user_id
+        FROM member_profiles
+        WHERE guild_id = $1
+          AND profile_message_id = $2
+        """
+        sql_delete = """
+        DELETE FROM member_profiles
+        WHERE guild_id = $1
+          AND profile_message_id = $2
+        """
+        async with self.bot.db.acquire() as conn:
+            row = await conn.fetchrow(sql_select, guild_id, message_id)
+            if row is None:
+                return None
+            await conn.execute(sql_delete, guild_id, message_id)
+            return row["user_id"]
+
+    async def rebuild_latest_profile_for_user(self, guild: discord.Guild, user_id: int):
+        channel_ids = await self.get_profile_channel_ids(guild.id)
+        latest_message: Optional[discord.Message] = None
+
+        for channel_id in channel_ids:
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            try:
+                async for msg in channel.history(
+                    limit=REBUILD_LIMIT_PER_CHANNEL if REBUILD_LIMIT_PER_CHANNEL > 0 else None
+                ):
+                    if msg.author.bot:
+                        continue
+                    if msg.author.id != user_id:
+                        continue
+
+                    if latest_message is None or msg.created_at > latest_message.created_at:
+                        latest_message = msg
+                    break
+            except discord.Forbidden:
+                log.warning("プロフィール再構築時に履歴取得権限なし guild_id=%s channel_id=%s", guild.id, channel_id)
+            except Exception:
+                log.exception("プロフィール再構築失敗 guild_id=%s channel_id=%s", guild.id, channel_id)
+
+        if latest_message is not None:
+            await self.upsert_profile_from_message(latest_message)
+
+    async def import_existing_messages(
+        self,
+        guild: discord.Guild,
+        limit_per_channel: int,
+    ) -> tuple[int, int]:
+        channel_ids = await self.get_profile_channel_ids(guild.id)
+        processed = 0
+        users: set[int] = set()
+
+        for channel_id in channel_ids:
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            try:
+                async for msg in channel.history(
+                    limit=None if limit_per_channel == 0 else limit_per_channel,
+                    oldest_first=False,
+                ):
+                    if msg.author.bot:
+                        continue
+
+                    await self.upsert_profile_from_message(msg)
+                    processed += 1
+                    users.add(msg.author.id)
+            except discord.Forbidden:
+                log.warning("既存取込で履歴取得権限なし guild_id=%s channel_id=%s", guild.id, channel_id)
+            except Exception:
+                log.exception("既存取込失敗 guild_id=%s channel_id=%s", guild.id, channel_id)
+
+        return processed, len(users)
 
     # =========================
     # VC投稿管理
@@ -341,7 +516,6 @@ class VCProfileDBCog(commands.Cog):
             return embed
 
         embed.description = self.trim_for_embed(profile["profile_content"] or "（本文なし）")
-
         embed.add_field(
             name="プロフィール元メッセージ",
             value=f"[ここを押すと移動]({profile['profile_jump_url']})",
@@ -454,7 +628,7 @@ class VCProfileDBCog(commands.Cog):
         if not settings or not settings["enabled"]:
             return
 
-        if message.channel.id != settings["prof_tc_id"]:
+        if not await self.is_profile_channel(message.guild.id, message.channel.id):
             return
 
         await self.upsert_profile_from_message(message)
@@ -468,24 +642,30 @@ class VCProfileDBCog(commands.Cog):
         if not settings or not settings["enabled"]:
             return
 
-        if after.channel.id != settings["prof_tc_id"]:
+        if not await self.is_profile_channel(after.guild.id, after.channel.id):
             return
 
         await self.update_profile_if_current_message(after)
 
     @commands.Cog.listener()
-    async def on_message_delete(self, message: discord.Message):
-        if message.author.bot or message.guild is None:
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if payload.guild_id is None:
             return
 
-        settings = await self.get_settings(message.guild.id)
+        settings = await self.get_settings(payload.guild_id)
         if not settings or not settings["enabled"]:
             return
 
-        if message.channel.id != settings["prof_tc_id"]:
+        if not await self.is_profile_channel(payload.guild_id, payload.channel_id):
             return
 
-        await self.delete_profile_if_current_message(message)
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+
+        user_id = await self.delete_profile_by_message_id(payload.guild_id, payload.message_id)
+        if user_id is not None:
+            await self.rebuild_latest_profile_for_user(guild, user_id)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -524,15 +704,10 @@ class VCProfileDBCog(commands.Cog):
     # =========================
     # 管理者コマンド
     # =========================
-    @app_commands.command(name="vcプロフ設定", description="このサーバーのVCプロフィール設定を保存します")
+    @app_commands.command(name="vcプロフ設定", description="VCプロフィール設定を保存します")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(
-        prof_tc="プロフィールを書かせるチャンネル",
-        men_role="男性ロール",
-        women_role="女性ロール",
-    )
     async def vc_profile_set(
         self,
         interaction: discord.Interaction,
@@ -555,9 +730,112 @@ class VCProfileDBCog(commands.Cog):
         await interaction.response.send_message(
             (
                 "VCプロフィール設定を保存しました。\n"
-                f"プロフチャンネル: {prof_tc.mention}\n"
+                f"メインチャンネル: {prof_tc.mention}\n"
                 f"男性ロール: {men_role.mention}\n"
                 f"女性ロール: {women_role.mention}"
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="vcプロフチャンネル追加", description="追加のプロフィールチャンネルを登録します")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def vc_profile_add_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+    ):
+        if interaction.guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        settings = await self.get_settings(interaction.guild.id)
+        if settings is None:
+            await interaction.response.send_message("先に /vcプロフ設定 を実行してください。", ephemeral=True)
+            return
+
+        await self.add_profile_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(
+            f"{channel.mention} を追加プロフィールチャンネルとして登録しました。",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="vcプロフチャンネル削除", description="プロフィールチャンネルを削除します")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def vc_profile_remove_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+    ):
+        if interaction.guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        ok, msg = await self.remove_profile_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @app_commands.command(name="vcプロフチャンネル一覧", description="プロフィールチャンネル一覧を表示します")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def vc_profile_channels(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        settings = await self.get_settings(interaction.guild.id, refresh=True)
+        if settings is None:
+            await interaction.response.send_message("まだ設定されていません。", ephemeral=True)
+            return
+
+        channel_ids = await self.get_profile_channel_ids(interaction.guild.id, refresh=True)
+        lines = []
+
+        for cid in channel_ids:
+            ch = interaction.guild.get_channel(cid)
+            label = ch.mention if ch else f"`{cid}`"
+            if cid == settings["prof_tc_id"]:
+                lines.append(f"メイン: {label}")
+            else:
+                lines.append(f"追加: {label}")
+
+        embed = discord.Embed(
+            title="プロフィールチャンネル一覧",
+            description="\n".join(lines) if lines else "なし",
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="vcプロフ既存取込", description="既存のプロフィール投稿をDBへ取り込みます")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def vc_profile_import(
+        self,
+        interaction: discord.Interaction,
+        limit_per_channel: app_commands.Range[int, 0, 100000] = IMPORT_DEFAULT_LIMIT,
+    ):
+        if interaction.guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        settings = await self.get_settings(interaction.guild.id)
+        if settings is None:
+            await interaction.response.send_message("先に /vcプロフ設定 を実行してください。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        processed, users = await self.import_existing_messages(interaction.guild, limit_per_channel)
+
+        await interaction.followup.send(
+            (
+                "既存プロフィールを取り込みました。\n"
+                f"処理メッセージ数: {processed}\n"
+                f"対象ユーザー数: {users}\n"
+                f"探索件数/チャンネル: {'全件' if limit_per_channel == 0 else limit_per_channel}"
             ),
             ephemeral=True,
         )
@@ -579,6 +857,7 @@ class VCProfileDBCog(commands.Cog):
         prof_ch = interaction.guild.get_channel(settings["prof_tc_id"])
         men_role = interaction.guild.get_role(settings["men_role_id"])
         women_role = interaction.guild.get_role(settings["women_role_id"])
+        channels = await self.get_profile_channel_ids(interaction.guild.id, refresh=True)
 
         embed = discord.Embed(
             title="VCプロフィール設定状況",
@@ -590,8 +869,13 @@ class VCProfileDBCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
-            name="プロフチャンネル",
+            name="メインチャンネル",
             value=prof_ch.mention if prof_ch else f"`{settings['prof_tc_id']}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="プロフィールチャンネル数",
+            value=str(len(channels)),
             inline=False,
         )
         embed.add_field(
