@@ -777,38 +777,6 @@ class VCProfileDBCog(commands.Cog):
         ok, msg = await self.remove_profile_channel(interaction.guild.id, channel.id)
         await interaction.response.send_message(msg, ephemeral=True)
 
-    @app_commands.command(name="vcプロフチャンネル一覧", description="プロフィールチャンネル一覧を表示します")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def vc_profile_channels(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
-            return
-
-        settings = await self.get_settings(interaction.guild.id, refresh=True)
-        if settings is None:
-            await interaction.response.send_message("まだ設定されていません。", ephemeral=True)
-            return
-
-        channel_ids = await self.get_profile_channel_ids(interaction.guild.id, refresh=True)
-        lines = []
-
-        for cid in channel_ids:
-            ch = interaction.guild.get_channel(cid)
-            label = ch.mention if ch else f"`{cid}`"
-            if cid == settings["prof_tc_id"]:
-                lines.append(f"メイン: {label}")
-            else:
-                lines.append(f"追加: {label}")
-
-        embed = discord.Embed(
-            title="プロフィールチャンネル一覧",
-            description="\n".join(lines) if lines else "なし",
-            color=discord.Color.blurple(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
     @app_commands.command(name="vcプロフ既存取込", description="既存のプロフィール投稿をDBへ取り込みます")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
