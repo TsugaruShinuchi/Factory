@@ -891,31 +891,6 @@ class VCProfileDBCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="vcプロフ無効", description="このサーバーのVCプロフィール機能を無効化します")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def vc_profile_disable(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
-            return
-
-        await self.disable_settings(interaction.guild.id)
-        await interaction.response.send_message("VCプロフィール機能を無効化しました。", ephemeral=True)
-
-    @app_commands.command(name="vcプロフ再同期", description="今VCにいるユーザー分のプロフィール埋め込みを再同期します")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def vc_profile_resync(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.force_resync_guild(interaction.guild)
-        await interaction.followup.send("VCプロフィールを再同期しました。", ephemeral=True)
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(VCProfileDBCog(bot))
