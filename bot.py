@@ -28,7 +28,16 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.invite_tracker")
         await self.load_extension("cogs.laliho")
         await self.load_extension("cogs.auto_reply")
-        await self.load_extension("cogs.vc_profile")
+        # await self.load_extension("cogs.vc_profile")
+        extensions = [
+            "cogs.invite_tracker",
+            "cogs.auto_reply",
+            "cogs.vc_profile_db",
+        ]
+
+        for ext in extensions:
+            if ext not in self.extensions:
+                await self.load_extension(ext)
 
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
